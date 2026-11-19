@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Install to PS2
+Comment=Send PS2 ISOs to the PS2 hard drive over OPL's NBD Server
+Exec=ps2-install %F
+Icon=media-optical-dvd
+MimeType=application/x-cd-image;application/vnd.efi.iso;
+Categories=Game;Utility;
+Terminal=false

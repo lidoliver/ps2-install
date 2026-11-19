@@ -1,0 +1,81 @@
+diff --git i/apa.c w/apa.c
+index 7f86251..0bb00f4 100644
+--- i/apa.c
++++ w/apa.c
+@@ -873,12 +873,16 @@ int apa_commit_ex(hio_t *hio,
+                   const apa_toc_t *toc)
+ {
+     int result = apa_check(toc);
++    if (result == RET_OK) /* everything the TOC refers to must already be on disk */
++        result = hio->flush(hio);
+     if (result == RET_OK) {
+         result = apa_commit_slice(hio, toc, 0);
+         if (result == RET_OK &&
+             toc->got_2nd_slice)
+             result = apa_commit_slice(hio, toc, 1);
+     }
++    if (result == RET_OK)
++        result = hio->flush(hio);
+     return (result);
+ }
+ 
+diff --git i/hdl.c w/hdl.c
+index eb913e5..970ead7 100644
+--- i/hdl.c
++++ w/hdl.c
+@@ -964,6 +964,9 @@ inject_data(hio_t *hio,
+              * therefore, main partition header is written here, at the end,
+              * where transfer can no longer be interrupted by the user */
+ 
++            if (result == RET_OK) /* game data on disk before the header points at it */
++                result = hio->flush(hio);
++
+             if (result == RET_OK) { /* last: write main partition header (4MB total) */
+                 u_int32_t sector;
+                 sector = get_u32(&part->start) + SLICE_2_OFFS * slice_index;
+diff --git i/hio_win32.c w/hio_win32.c
+index e3514fb..193e036 100644
+--- i/hio_win32.c
++++ w/hio_win32.c
+@@ -26,6 +26,9 @@
+ #include "retcodes.h"
+ #include <ctype.h>
+ #include <string.h>
++#if defined(_BUILD_UNIX)
++#include <unistd.h>
++#endif
+ 
+ 
+ typedef struct hio_win32_type
+@@ -98,7 +101,15 @@ win32_write(hio_t *hio,
+ /**************************************************************/
+ static int
+ win32_flush(/*@unused@*/ hio_t *hio)
+-{ /* win32_flush is intentionately blank */
++{
++#if defined(_BUILD_UNIX)
++    /* the device is no longer opened with O_DSYNC, so flush for real */
++    hio_win32_t *hw32 = (hio_win32_t *)hio;
++    if (fsync(hw32->device.desc) != 0) {
++        hw32->error_code = osal_get_last_error_code();
++        return (RET_ERR);
++    }
++#endif
+     return (RET_OK);
+ }
+ 
+diff --git i/osal_unix.c w/osal_unix.c
+index 1298b9f..f9da216 100644
+--- i/osal_unix.c
++++ w/osal_unix.c
+@@ -95,7 +95,9 @@ int /* OSAL_OK, OSAL_ERR */
+ osal_open_device_for_writing(const char *device_name,
+                              osal_handle_t *handle)
+ {
+-    handle->desc = open(device_name, O_RDWR | O_LARGEFILE | O_DSYNC, S_IRUSR | S_IWUSR);
++    handle->desc = open(device_name, O_RDWR | O_LARGEFILE, S_IRUSR | S_IWUSR);
++    /* no O_DSYNC: over NBD it turns every write into a round trip (~0.45 MB/s);
++     * durability comes from explicit hio->flush() calls at the commit points */
+     return (handle->desc == -1 ? OSAL_ERR : OSAL_OK);
+ }
+ 

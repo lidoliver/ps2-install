@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# ps2-install — install PS2 ISOs onto the PS2's internal HDD over OPL's NBD Server.
+# Usage: ps2-install [file.iso ...]    (no arguments = file picker)
+# Start "NBD Server" in OPL on the PS2 first.
+# Settings (env vars, or put them in ~/.config/ps2-install.conf):
+#   PS2_IP    the PS2's address                     (default 10.0.0.50)
+#   PS2_RATE  upload pacing while connected          (default 40mbit)
+#   PS2_GAMES folder with DVD/, CD/ and ART/         (default ~/Documents/ps2game)
+set -uo pipefail
+
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/ps2-install.conf"
+# shellcheck source=/dev/null
+[[ -f $conf ]] && . "$conf"
+
+# Sleep drops the network mid-transfer and every remaining game then fails with
+# an I/O error: hold a logind inhibitor (Plasma honours it) for the whole run
+if [[ -z ${PS2_INSTALL_INHIBITED:-} ]] && command -v systemd-inhibit >/dev/null; then
+    PS2_INSTALL_INHIBITED=1 exec systemd-inhibit --what=sleep:idle --mode=block \
+        --who="Install to PS2" --why="Copying games to the PS2 HDD" "$0" "$@"
+fi
+
+PS2_IP=${PS2_IP:-10.0.0.50}
+# Upload pacing while connected: a cheap switch/mesh node between a 1 Gbit PC and
+# the 100 Mbit PS2 drops bursts; pacing each connection at this rate stops the loss
+PS2_RATE=${PS2_RATE:-40mbit}
+DEV=/dev/nbd0
+PS2_GAMES=${PS2_GAMES:-$HOME/Documents/ps2game}
+# find a tool on PATH, falling back to ~/.local/bin
+tool() { command -v "$1" 2>/dev/null || echo "$HOME/.local/bin/$1"; }
+HDL=${HDL:-$(tool hdl_dump)}
+TITLE="Install to PS2"
+RUN="${XDG_RUNTIME_DIR:-/tmp}/ps2-install"
+LOG="$RUN/hdl.log"
+
+err() { kdialog --title "$TITLE" --error "$1"; exit 1; }
+
+# Game ID (e.g. SCUS_971.98), read from SYSTEM.CNF inside the ISO
+game_id() { "$HDL" cdvd_info "$1" 2>/dev/null | grep -oE 'S[A-Z]{3}_[0-9]{3}\.[0-9]{2}' | head -1; }
+
+# Display name: filename without the "SCUS_971.98." prefix
+# (cut to 64 chars: HDL_GAME_NAME_MAX in hdl_dump)
+game_name() { basename "$1" .iso | sed -E 's/^S[A-Z]{3}_[0-9]{3}\.[0-9]{2}\.//' | cut -c1-64; }
+
+# What to do when the game ID is already on the HDD.
+# $1 = display name, $2 = game ID. Return 0 to install anyway, 1 to skip.
+# Skips for now: installing twice would only create a second copy.
+handle_existing() {
+    return 1
+}
+
+command -v nbd-client >/dev/null || err "nbd-client is missing.\n\nRun: sudo pacman -S nbd"
+[[ -x $HDL ]] || err "hdl_dump not found at $HDL"
+command -v qdbus6 >/dev/null || err "qdbus6 is missing (progress bars).\n\nRun: sudo pacman -S qt6-tools"
+
+mkdir -p "$RUN"
+exec 9>"$RUN/lock"
+flock -n 9 || err "ps2-install is already running."
+
+# --- pick ISOs (before connecting, so Cancel costs nothing) ---
+if (( $# )); then
+    isos=("$@")
+else
+    mapfile -t isos < <(kdialog --title "$TITLE" --multiple --separate-output \
+        --getopenfilename "$PS2_GAMES/DVD" "*.iso *.ISO|PS2 ISO images")
+fi
+if (( ! ${#isos[@]} )); then
+    kdialog --title "$TITLE" --yesno "No games selected.\n\nJust sync cover art to the PS2 HDD?" || exit 0
+fi
+
+# --- connect ---
+# OPL also exports mc0/mc1 (memory cards — FMCB lives there), ram and bios: only ever take hdd0
+exports=$(nbd-client -l "$PS2_IP" 2>/dev/null)
+[[ -n $exports ]] || err "Can't reach the NBD Server at $PS2_IP.\n\nIs \"NBD Server\" running in OPL?"
+grep -q '^hdd0:' <<<"$exports" || err "The PS2 isn't exporting its HDD (no hdd0).\n\nIs HDD device start mode enabled in OPL?"
+export_name=hdd0
+
+# One root helper (one password prompt) connects, hands the device to us, then
+# waits for this script's PID to go away. However the script ends — finished,
+# cancelled, crashed, killed — the helper syncs, disconnects and removes the
+# pacing within a second.
+pkexec /bin/sh -c '
+    modprobe nbd && nbd-client -N "$1" -b 512 -t 60 "$2" "$3" || exit 1
+    # fq maxrate caps each connection; deleting the root qdisc afterwards puts
+    # back the system default (fq_codel)
+    ifc=$(ip route get "$2" | sed -n "s/.* dev \([^ ]*\).*/\1/p")
+    tc qdisc replace dev "$ifc" root fq maxrate "$6"
+    # hdl_dump no longer syncs every write; cap unsent data at 32 MB so the
+    # progress bar tracks what actually reached the PS2
+    echo 1 > /sys/block/nbd0/bdi/strict_limit
+    echo 33554432 > /sys/block/nbd0/bdi/max_bytes
+    chown "$4" "$3"
+    while kill -0 "$5" 2>/dev/null; do sleep 1; done
+    sync; nbd-client -d "$3"; chown 0 "$3"
+    tc qdisc del dev "$ifc" root
+' sh "$export_name" "$PS2_IP" "$DEV" "$(id -u)" "$$" "$PS2_RATE" &
+helper=$!
+
+for _ in $(seq 120); do
+    size=$(cat /sys/block/nbd0/size 2>/dev/null || echo 0)
+    (( size > 0 )) && [[ $(stat -c %u "$DEV") == "$(id -u)" ]] && break
+    # not kill -0: once authenticated the helper runs as root and we may not signal it
+    [[ -d /proc/$helper ]] || err "Couldn't connect to the PS2 HDD (wrong password or NBD error)."
+    sleep 0.5
+done
+
+# OPL exports read-only unless "Enable Write Operations" is on (writes then fail with EPERM)
+[[ $(cat /sys/block/nbd0/ro 2>/dev/null) == 1 ]] \
+    && err "The PS2 is sharing its HDD read-only.\n\nIn OPL: Settings → Enable Write Operations → On, Save Changes, then start NBD Server again."
+"$HDL" hdl_toc "$DEV" >/dev/null 2>&1 \
+    || err "Connected, but hdl_dump can't read the drive.\n\nIs the PS2 HDD formatted (wLaunchELF → HddManager)?"
+
+# --- install ---
+done_list=() skip_list=() fail_list=()
+total=${#isos[@]} n=0
+for iso in "${isos[@]}"; do
+    n=$((n + 1))
+    name=$(game_name "$iso")
+    id=$(game_id "$iso")
+    [[ -n $id ]] || { fail_list+=("$name (no game ID — not a PS2 ISO?)"); continue; }
+
+    if "$HDL" hdl_toc "$DEV" 2>/dev/null | grep -qF "$id"; then
+        handle_existing "$name" "$id" || { skip_list+=("$name"); continue; }
+    fi
+
+    # CD-sized images go in as CD, everything else as DVD
+    cmd=inject_dvd
+    [[ $iso == */CD/* || $(stat -c %s "$iso") -lt 900000000 ]] && cmd=inject_cd
+
+    bar=$(kdialog --title "$TITLE" --progressbar "[$n/$total] $name" 100)
+    qdbus6 $bar showCancelButton true >/dev/null
+    "$HDL" $cmd "$DEV" "$name" "$iso" "$id" >"$LOG" 2>&1 &
+    pid=$!
+    cancelled=0
+    while kill -0 "$pid" 2>/dev/null; do
+        # Cancel closes the dialog, so a failed query also counts as cancelled
+        if ! c=$(qdbus6 $bar wasCancelled 2>/dev/null) || [[ $c == true ]]; then
+            kill -INT "$pid"; cancelled=1
+        fi
+        # progress line looks like: "] 42%, 12 min remaining, 4.81 MB/sec"
+        line=$(tail -c 400 "$LOG" | tr '\r' '\n' | grep -E '[0-9]+%, ' | tail -1)
+        if [[ $line =~ ([0-9]+)%,\ (.*)\ remaining,\ ([0-9.]+\ MB/sec) ]]; then
+            qdbus6 $bar Set "" value "${BASH_REMATCH[1]}" >/dev/null
+            qdbus6 $bar setLabelText "[$n/$total] $name — ${BASH_REMATCH[2]} left (${BASH_REMATCH[3]})" >/dev/null
+        fi
+        sleep 1
+    done
+    wait "$pid"; rc=$?
+    qdbus6 $bar close >/dev/null 2>&1
+
+    if (( cancelled )); then
+        skip_list+=("$name (cancelled — nothing written)")
+        break
+    elif (( rc == 0 )); then
+        done_list+=("$name")
+    else
+        fail_list+=("$name: $(tr '\r' '\n' <"$LOG" | grep -v '%' | tail -1)")
+    fi
+done
+
+# --- art: copy covers/icons for every game on the HDD into +OPL/ART ---
+# OPL reads HDD art from the +OPL partition (pfs0:ART/), not from the game partitions
+ART_DIR="$PS2_GAMES/ART"
+PFS=$(tool pfsshell)
+art_count=0
+if [[ -x $PFS ]]; then
+    mapfile -t hdd_ids < <("$HDL" hdl_toc "$DEV" 2>/dev/null | grep -oE 'S[A-Z]{3}_[0-9]{3}\.[0-9]{2}' | sort -u)
+    # fetch any art we don't have yet (archive.org; skips existing files, failures are non-fatal)
+    (( ${#hdd_ids[@]} )) && PS2_GAMES="$PS2_GAMES" "$(tool ps2-art)" "${hdd_ids[@]}" >"$RUN/art.log" 2>&1
+    mapfile -t art_files < <(
+        for gid in "${hdd_ids[@]}"; do (cd "$ART_DIR" 2>/dev/null && ls -1 "$gid"_* 2>/dev/null); done)
+    if (( ${#art_files[@]} )); then
+        {
+            echo "device $DEV"
+            echo "mount +OPL"
+            echo "mkdir ART"
+            echo "cd ART"
+            echo "lcd $ART_DIR"
+            for f in "${art_files[@]}"; do echo "rm $f"; echo "put $f"; done
+            echo "umount"
+            echo "exit"
+        } | "$PFS" >"$RUN/pfs.log" 2>&1
+        art_count=${#art_files[@]}
+    fi
+fi
+
+# --- summary ---
+summary="Installed: ${#done_list[@]}"
+for g in "${done_list[@]}"; do summary+="\n  ✓ $g"; done
+for g in "${skip_list[@]}"; do summary+="\n  – $g"; done
+for g in "${fail_list[@]}"; do summary+="\n  ✗ $g"; done
+(( art_count )) && summary+="\n\nArt files synced to +OPL/ART: $art_count"
+summary+="\n\nOn the PS2 HDD now:\n$("$HDL" hdl_toc "$DEV" 2>/dev/null | awk 'NR>1 && NF>=6 {$1=$2=$3=$4=""; print "  " $0}' | sed 's/^ *//; s/^/  /')"
+kdialog --title "$TITLE" --msgbox "$(echo -e "$summary")"
