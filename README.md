@@ -18,6 +18,16 @@ ISO ──▶ hdl_dump ──▶ /dev/nbd0 ══ NBD over LAN ══▶ OPL NBD
 
 The transfer logic is the same on both branches. Only the dialogs and launcher integration differ.
 
+**You're on `omarchy`.** You can start it three ways:
+
+- **App launcher:** "Install to PS2" opens a floating terminal and lets you pick from `$PS2_GAMES/DVD` and `CD` with `gum choose` (space selects, enter starts).
+- **Nautilus:** select ISOs, then right-click → Scripts → Install to PS2.
+- **Terminal:** `ps2-install *.iso`.
+
+`sudo` asks for your password once. Each game shows hdl_dump's own progress gauge, and Ctrl+C cancels the current game and the rest of the batch without leaving anything half-written. You get a desktop notification when the batch is done, so you can walk away from long installs.
+
+Omarchy doesn't run a graphical polkit agent, so `pkexec` has nothing to show a password prompt with. That's why this branch uses `sudo` in the terminal instead. The root helper is started with `setsid` and ignores `SIGINT`, so pressing Ctrl+C on a game can't skip disconnecting the drive.
+
 ## What it does
 
 1. Asks for ISOs, either as arguments, from the right-click menu, or through a file picker.

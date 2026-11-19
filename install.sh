@@ -13,15 +13,15 @@ HDL_DUMP_REV=32c296c   # the commit patches/hdl-dump-no-odsync.patch was made ag
 mkdir -p "$BIN" "$APPS"
 install -m755 ps2-install ps2-art "$BIN/"
 
-# --- frontend: KDE (kdialog progress bars, Dolphin right-click menu) ---
+# --- frontend: Omarchy (floating terminal + gum, Nautilus script) ---
 # launchers don't always have ~/.local/bin on PATH: point Exec at the full path
-exec_path() { sed "s|^Exec=ps2-install|Exec=$BIN/ps2-install|" "$1"; }
-exec_path kde/ps2-install.desktop >"$APPS/ps2-install.desktop"
-SERVICEMENUS="${XDG_DATA_HOME:-$HOME/.local/share}/kio/servicemenus"
-mkdir -p "$SERVICEMENUS"
-exec_path kde/ps2-install-servicemenu.desktop >"$SERVICEMENUS/ps2-install.desktop"
-chmod 755 "$SERVICEMENUS/ps2-install.desktop"   # KF6 only runs executable service menus
-need=(kdialog qdbus6 nbd-client)
+exec_path() { sed "s|ps2-install |$BIN/ps2-install |" "$1"; }
+exec_path omarchy/ps2-install.desktop >"$APPS/ps2-install.desktop"
+SCRIPTS="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus/scripts"
+mkdir -p "$SCRIPTS"
+exec_path omarchy/nautilus-script >"$SCRIPTS/Install to PS2"
+chmod 755 "$SCRIPTS/Install to PS2"
+need=(gum nbd-client)
 # ---
 
 if [[ ${1:-} == --hdl-dump ]]; then

@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
 # ps2-install — install PS2 ISOs onto the PS2's internal HDD over OPL's NBD Server.
-# Usage: ps2-install [file.iso ...]    (no arguments = file picker)
+# Usage: ps2-install [file.iso ...]    (no arguments = pick from $PS2_GAMES/{DVD,CD})
 # Start "NBD Server" in OPL on the PS2 first.
+# Omarchy frontend: runs in a floating terminal (gum), asks for sudo once.
 # Settings (env vars, or put them in ~/.config/ps2-install.conf):
 #   PS2_IP    the PS2's address                     (default 10.0.0.50)
 #   PS2_RATE  upload pacing while connected          (default 40mbit)
 #   PS2_GAMES folder with DVD/, CD/ and ART/         (default ~/Documents/ps2game)
 set -uo pipefail
 
+# Started from the app launcher or Nautilus: reopen in a floating terminal.
+# Paths are made absolute first, since the terminal starts in another directory.
+if [[ ! -t 0 || ! -t 1 ]]; then
+    args=()
+    for f in "$@"; do args+=("$(realpath -- "$f")"); done
+    cmd=$(printf '%q ' "$(realpath -- "$0")" "${args[@]}")
+    if command -v omarchy-launch-floating-terminal-with-presentation >/dev/null; then
+        exec omarchy-launch-floating-terminal-with-presentation "$cmd"
+    fi
+    exec xdg-terminal-exec bash -c "$cmd; read -rsn1 -p 'Press any key to close'"
+fi
+
 conf="${XDG_CONFIG_HOME:-$HOME/.config}/ps2-install.conf"
 # shellcheck source=/dev/null
 [[ -f $conf ]] && . "$conf"
-
-# Sleep drops the network mid-transfer and every remaining game then fails with
-# an I/O error: hold a logind inhibitor (Plasma honours it) for the whole run
-if [[ -z ${PS2_INSTALL_INHIBITED:-} ]] && command -v systemd-inhibit >/dev/null; then
-    PS2_INSTALL_INHIBITED=1 exec systemd-inhibit --what=sleep:idle --mode=block \
-        --who="Install to PS2" --why="Copying games to the PS2 HDD" "$0" "$@"
-fi
 
 PS2_IP=${PS2_IP:-10.0.0.50}
 # Upload pacing while connected: a cheap switch/mesh node between a 1 Gbit PC and
@@ -32,7 +38,13 @@ TITLE="Install to PS2"
 RUN="${XDG_RUNTIME_DIR:-/tmp}/ps2-install"
 LOG="$RUN/hdl.log"
 
-err() { kdialog --title "$TITLE" --error "$1"; exit 1; }
+err() {
+    echo
+    gum style --border rounded --padding "0 1" --foreground 1 "$(echo -e "$1")"
+    notify-send -u critical "$TITLE" "$(echo -e "$1" | head -1)" 2>/dev/null
+    exit 1
+}
+step() { gum style --bold "$*"; }
 
 # Game ID (e.g. SCUS_971.98), read from SYSTEM.CNF inside the ISO
 game_id() { "$HDL" cdvd_info "$1" 2>/dev/null | grep -oE 'S[A-Z]{3}_[0-9]{3}\.[0-9]{2}' | head -1; }
@@ -48,58 +60,74 @@ handle_existing() {
     return 1
 }
 
+command -v gum >/dev/null || { echo "gum is missing. Run: sudo pacman -S gum"; exit 1; }
 command -v nbd-client >/dev/null || err "nbd-client is missing.\n\nRun: sudo pacman -S nbd"
 [[ -x $HDL ]] || err "hdl_dump not found at $HDL"
-command -v qdbus6 >/dev/null || err "qdbus6 is missing (progress bars).\n\nRun: sudo pacman -S qt6-tools"
 
 mkdir -p "$RUN"
 exec 9>"$RUN/lock"
 flock -n 9 || err "ps2-install is already running."
 
-# --- pick ISOs (before connecting, so Cancel costs nothing) ---
+# Sleep drops the network mid-transfer and every remaining game then fails with
+# an I/O error: hold a logind inhibitor (hypridle honours it) until this script
+# exits. Detached with setsid so Ctrl+C on a game doesn't take it down.
+command -v systemd-inhibit >/dev/null && setsid -f systemd-inhibit --what=sleep:idle --mode=block \
+    --who="$TITLE" --why="Copying games to the PS2 HDD" tail --pid=$$ -f /dev/null >/dev/null 2>&1
+
+# --- pick ISOs (before connecting, so Esc costs nothing) ---
+isos=()
 if (( $# )); then
     isos=("$@")
 else
-    mapfile -t isos < <(kdialog --title "$TITLE" --multiple --separate-output \
-        --getopenfilename "$PS2_GAMES/DVD" "*.iso *.ISO|PS2 ISO images")
+    mapfile -t found < <(cd "$PS2_GAMES" 2>/dev/null && find DVD CD -maxdepth 1 -type f -iname '*.iso' 2>/dev/null | sort)
+    if (( ${#found[@]} )); then
+        mapfile -t picked < <(printf '%s\n' "${found[@]}" | gum choose --no-limit \
+            --header "Games to install (space = select, enter = go, esc = none)")
+        for p in "${picked[@]}"; do isos+=("$PS2_GAMES/$p"); done
+    fi
 fi
 if (( ! ${#isos[@]} )); then
-    kdialog --title "$TITLE" --yesno "No games selected.\n\nJust sync cover art to the PS2 HDD?" || exit 0
+    gum confirm "No games selected. Just sync cover art to the PS2 HDD?" || exit 130
 fi
 
 # --- connect ---
 # OPL also exports mc0/mc1 (memory cards — FMCB lives there), ram and bios: only ever take hdd0
+step "Connecting to $PS2_IP…"
 exports=$(nbd-client -l "$PS2_IP" 2>/dev/null)
 [[ -n $exports ]] || err "Can't reach the NBD Server at $PS2_IP.\n\nIs \"NBD Server\" running in OPL?"
 grep -q '^hdd0:' <<<"$exports" || err "The PS2 isn't exporting its HDD (no hdd0).\n\nIs HDD device start mode enabled in OPL?"
 export_name=hdd0
 
-# One root helper (one password prompt) connects, hands the device to us, then
-# waits for this script's PID to go away. However the script ends — finished,
-# cancelled, crashed, killed — the helper syncs, disconnects and removes the
-# pacing within a second.
-pkexec /bin/sh -c '
-    modprobe nbd && nbd-client -N "$1" -b 512 -t 60 "$2" "$3" || exit 1
+# One root helper connects, hands the device to us, then waits for this
+# script's PID to go away. However the script ends — finished, cancelled,
+# crashed, killed — the helper syncs, disconnects and removes the pacing within
+# a second. It runs in its own session (setsid) and ignores INT/HUP, so Ctrl+C
+# on a game or closing the terminal can't skip the cleanup.
+sudo -v -p "Password (to attach the PS2 HDD): " || err "sudo failed."
+rm -f "$RUN/helper.failed"
+sudo -n setsid -f /bin/sh -c '
+    trap "" INT HUP
+    fail() { echo "$1" >"$7/helper.failed"; exit 1; }
+    modprobe nbd && nbd-client -N "$1" -b 512 -t 60 "$2" "$3" || fail "nbd-client failed"
     # fq maxrate caps each connection; deleting the root qdisc afterwards puts
     # back the system default (fq_codel)
     ifc=$(ip route get "$2" | sed -n "s/.* dev \([^ ]*\).*/\1/p")
     tc qdisc replace dev "$ifc" root fq maxrate "$6"
     # hdl_dump no longer syncs every write; cap unsent data at 32 MB so the
-    # progress bar tracks what actually reached the PS2
+    # progress tracks what actually reached the PS2
     echo 1 > /sys/block/nbd0/bdi/strict_limit
     echo 33554432 > /sys/block/nbd0/bdi/max_bytes
     chown "$4" "$3"
     while kill -0 "$5" 2>/dev/null; do sleep 1; done
     sync; nbd-client -d "$3"; chown 0 "$3"
     tc qdisc del dev "$ifc" root
-' sh "$export_name" "$PS2_IP" "$DEV" "$(id -u)" "$$" "$PS2_RATE" &
-helper=$!
+' sh "$export_name" "$PS2_IP" "$DEV" "$(id -u)" "$$" "$PS2_RATE" "$RUN" \
+    </dev/null >"$RUN/helper.log" 2>&1 || err "Couldn't start the root helper."
 
 for _ in $(seq 120); do
     size=$(cat /sys/block/nbd0/size 2>/dev/null || echo 0)
     (( size > 0 )) && [[ $(stat -c %u "$DEV") == "$(id -u)" ]] && break
-    # not kill -0: once authenticated the helper runs as root and we may not signal it
-    [[ -d /proc/$helper ]] || err "Couldn't connect to the PS2 HDD (wrong password or NBD error)."
+    [[ -e $RUN/helper.failed ]] && err "Couldn't connect to the PS2 HDD.\n\n$(cat "$RUN/helper.log")"
     sleep 0.5
 done
 
@@ -110,8 +138,13 @@ done
     || err "Connected, but hdl_dump can't read the drive.\n\nIs the PS2 HDD formatted (wLaunchELF → HddManager)?"
 
 # --- install ---
+# Ctrl+C reaches hdl_dump directly (same terminal), which stops it; the trap
+# only records it. hdl_dump registers a game as its very last step, so a
+# cancelled game leaves nothing behind.
 done_list=() skip_list=() fail_list=()
 total=${#isos[@]} n=0
+cancelled=0
+trap 'cancelled=1' INT
 for iso in "${isos[@]}"; do
     n=$((n + 1))
     name=$(game_name "$iso")
@@ -119,33 +152,19 @@ for iso in "${isos[@]}"; do
     [[ -n $id ]] || { fail_list+=("$name (no game ID — not a PS2 ISO?)"); continue; }
 
     if "$HDL" hdl_toc "$DEV" 2>/dev/null | grep -qF "$id"; then
-        handle_existing "$name" "$id" || { skip_list+=("$name"); continue; }
+        handle_existing "$name" "$id" || { skip_list+=("$name (already on the HDD)"); continue; }
     fi
 
     # CD-sized images go in as CD, everything else as DVD
     cmd=inject_dvd
     [[ $iso == */CD/* || $(stat -c %s "$iso") -lt 900000000 ]] && cmd=inject_cd
 
-    bar=$(kdialog --title "$TITLE" --progressbar "[$n/$total] $name" 100)
-    qdbus6 $bar showCancelButton true >/dev/null
-    "$HDL" $cmd "$DEV" "$name" "$iso" "$id" >"$LOG" 2>&1 &
-    pid=$!
-    cancelled=0
-    while kill -0 "$pid" 2>/dev/null; do
-        # Cancel closes the dialog, so a failed query also counts as cancelled
-        if ! c=$(qdbus6 $bar wasCancelled 2>/dev/null) || [[ $c == true ]]; then
-            kill -INT "$pid"; cancelled=1
-        fi
-        # progress line looks like: "] 42%, 12 min remaining, 4.81 MB/sec"
-        line=$(tail -c 400 "$LOG" | tr '\r' '\n' | grep -E '[0-9]+%, ' | tail -1)
-        if [[ $line =~ ([0-9]+)%,\ (.*)\ remaining,\ ([0-9.]+\ MB/sec) ]]; then
-            qdbus6 $bar Set "" value "${BASH_REMATCH[1]}" >/dev/null
-            qdbus6 $bar setLabelText "[$n/$total] $name — ${BASH_REMATCH[2]} left (${BASH_REMATCH[3]})" >/dev/null
-        fi
-        sleep 1
-    done
-    wait "$pid"; rc=$?
-    qdbus6 $bar close >/dev/null 2>&1
+    echo
+    step "[$n/$total] $name  ($id)"
+    gum style --faint "Ctrl+C cancels this game and the rest of the batch"
+    "$HDL" $cmd "$DEV" "$name" "$iso" "$id" 2>&1 | tee -i "$LOG"
+    rc=${PIPESTATUS[0]}
+    echo
 
     if (( cancelled )); then
         skip_list+=("$name (cancelled — nothing written)")
@@ -156,6 +175,7 @@ for iso in "${isos[@]}"; do
         fail_list+=("$name: $(tr '\r' '\n' <"$LOG" | grep -v '%' | tail -1)")
     fi
 done
+trap - INT
 
 # --- art: copy covers/icons for every game on the HDD into +OPL/ART ---
 # OPL reads HDD art from the +OPL partition (pfs0:ART/), not from the game partitions
@@ -165,10 +185,14 @@ art_count=0
 if [[ -x $PFS ]]; then
     mapfile -t hdd_ids < <("$HDL" hdl_toc "$DEV" 2>/dev/null | grep -oE 'S[A-Z]{3}_[0-9]{3}\.[0-9]{2}' | sort -u)
     # fetch any art we don't have yet (archive.org; skips existing files, failures are non-fatal)
-    (( ${#hdd_ids[@]} )) && PS2_GAMES="$PS2_GAMES" "$(tool ps2-art)" "${hdd_ids[@]}" >"$RUN/art.log" 2>&1
+    if (( ${#hdd_ids[@]} )); then
+        gum spin --title "Fetching cover art…" -- env PS2_GAMES="$PS2_GAMES" "$(tool ps2-art)" "${hdd_ids[@]}" \
+            >"$RUN/art.log" 2>&1
+    fi
     mapfile -t art_files < <(
         for gid in "${hdd_ids[@]}"; do (cd "$ART_DIR" 2>/dev/null && ls -1 "$gid"_* 2>/dev/null); done)
     if (( ${#art_files[@]} )); then
+        step "Syncing ${#art_files[@]} art files to +OPL/ART…"
         {
             echo "device $DEV"
             echo "mount +OPL"
@@ -190,4 +214,8 @@ for g in "${skip_list[@]}"; do summary+="\n  – $g"; done
 for g in "${fail_list[@]}"; do summary+="\n  ✗ $g"; done
 (( art_count )) && summary+="\n\nArt files synced to +OPL/ART: $art_count"
 summary+="\n\nOn the PS2 HDD now:\n$("$HDL" hdl_toc "$DEV" 2>/dev/null | awk 'NR>1 && NF>=6 {$1=$2=$3=$4=""; print "  " $0}' | sed 's/^ *//; s/^/  /')"
-kdialog --title "$TITLE" --msgbox "$(echo -e "$summary")"
+echo
+gum style --border rounded --padding "0 1" "$(echo -e "$summary")"
+gum style --faint "When this finishes, reset the PS2 — OPL's \"NBD Server unloading…\" freezes (OPL bug #1012)."
+notify-send "$TITLE" "Installed ${#done_list[@]}, failed ${#fail_list[@]}, skipped ${#skip_list[@]}" 2>/dev/null
+(( ${#fail_list[@]} == 0 ))
